@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""NST 규정집 MCP 서버 - 국가과학기술연구회 규정집 게시판 연동
+# -*- coding: utf-8 -*-
+"""NST 규정집 MCP 서버 — 국가과학기술연구회 규정집 게시판 연동
 
 URL 파라미터 구조:
   searchRegltn       : 기관 코드 (REGLTN01=NST, REGLTN02=KICA, REGLTN03=BRIC)
@@ -8,6 +9,7 @@ URL 파라미터 구조:
 
 import asyncio
 import re
+import sys
 from typing import Any
 from urllib.parse import urljoin
 
@@ -17,41 +19,71 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp import types
 
+# Python 3.12 미만 Windows에서 ProactorEventLoop 대신 SelectorEventLoop 사용 (httpx 호환)
+if sys.platform == "win32" and sys.version_info < (3, 12):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 BASE_URL = "https://www.nst.re.kr/rulebook/"
 
-# 기관 코드 → searchRegltn 파라미터
-ORGANIZATIONS = {
+ORGANIZATIONS: dict[str, dict[str, str]] = {
     "NST":  {"name": "국가과학기술연구회", "regltn": "REGLTN01"},
     "KICA": {"name": "산업기술연구회",     "regltn": "REGLTN02"},
     "BRIC": {"name": "기초기술연구회",     "regltn": "REGLTN03"},
 }
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
     "Referer": "https://www.nst.re.kr/",
 }
 
+# search_regulations 병렬 요청 제한 (NST 서버 부하 방지)
+_SEMAPHORE = asyncio.Semaphore(5)
 
-async def fetch_page(url: str, params: dict | None = None) -> BeautifulSoup:
-    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=30) as client:
-        resp = await client.get(url, params=params)
+
+async def fetch_page(
+    url: str,
+    params: dict | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> BeautifulSoup:
+    """URL을 가져와 BeautifulSoup 객체 반환.
+
+    client를 전달하면 기존 세션을 재사용하고, 없으면 새로 생성한다.
+    html.parser를 사용해 lxml 추가 설치 없이 동작한다.
+    """
+    async def _get(c: httpx.AsyncClient) -> BeautifulSoup:
+        resp = await c.get(url, params=params)
         resp.raise_for_status()
-        return BeautifulSoup(resp.text, "lxml")
+        return BeautifulSoup(resp.text, "html.parser")
+
+    if client is not None:
+        return await _get(client)
+
+    async with httpx.AsyncClient(
+        headers=HEADERS, follow_redirects=True, timeout=30
+    ) as c:
+        return await _get(c)
 
 
 def _parse_chapters(soup: BeautifulSoup) -> list[dict]:
-    """편 목록 파싱 — <select id="sel_01"> 옵션 사용
+    """편 목록 파싱 — <select id="sel_01"> 옵션
+
     반환: [{"no": "3", "name": "제 1편 법령 및 정관"}, ...]
     """
-    chapters = []
-    sel = soup.find("select", {"id": "sel_01"})
+    chapters: list[dict] = []
+    # NST HTML에 id 속성이 두 번 선언됨: id="sel_01" id="searchUpperRegltnNo"
+    # html.parser는 마지막 id 값(searchUpperRegltnNo)을 사용하므로 해당 값으로 탐색
+    sel = soup.find("select", {"id": "searchUpperRegltnNo"})
     if not sel:
         return chapters
     for opt in sel.find_all("option"):
         value = opt.get("value", "").strip()
-        text = opt.get_text(" ", strip=True).replace("\xa0", " ").strip()
+        text = re.sub(r"[\xa0\s]+", " ", opt.get_text(" ", strip=True)).strip()
         if value and text:
             chapters.append({"no": value, "name": text})
     return chapters
@@ -59,9 +91,11 @@ def _parse_chapters(soup: BeautifulSoup) -> list[dict]:
 
 def _parse_regulations(soup: BeautifulSoup) -> list[dict]:
     """규정 목록 파싱 — <ol class="lstBody"> > <li> 구조
-    각 li 안: ul.sep > li.col1(번호) col2(제목) col3(다운로드) col4(이력)
+
+    구조: ul.sep > li.col1(번호) · col2(제목) · col3(다운로드) · col4(이력헤더)
+    col4는 현재 NST HTML에서 헤더 텍스트만 포함하며 링크 없음.
     """
-    regulations = []
+    regulations: list[dict] = []
     for item in soup.select("ol.lstBody > li"):
         col1 = item.select_one("li.col1")
         col2 = item.select_one("li.col2")
@@ -72,24 +106,23 @@ def _parse_regulations(soup: BeautifulSoup) -> list[dict]:
         if not number:
             continue
 
-        # 제목과 외부 링크
+        # 제목 및 외부 링크 추출
         title = ""
         external_url = None
         if col2:
             a = col2.find("a")
             if a:
                 raw = a.get_text(" ", strip=True)
-                # "* 국가법령정보센터(링크)" 같은 주석 제거
+                # "* 국가법령정보센터(링크)" 형태 주석 제거
                 title = re.sub(r"\s*\*\s*.+$", "", raw).strip()
                 href = a.get("href", "")
                 if href.startswith("http"):
                     external_url = href
             else:
-                raw = col2.get_text(" ", strip=True)
-                title = re.sub(r"\s*\*\s*.+$", "", raw).strip()
+                title = re.sub(r"\s*\*\s*.+$", "", col2.get_text(" ", strip=True)).strip()
 
-        # 다운로드 링크 (col3)
-        downloads = {}
+        # HWP / PDF 다운로드 링크 추출
+        downloads: dict[str, dict] = {}
         search_in = col3 if col3 else item
         for a in search_in.select("a[href*='downloadRegltnBook']"):
             href = a.get("href", "")
@@ -99,19 +132,19 @@ def _parse_regulations(soup: BeautifulSoup) -> list[dict]:
             if m_no and m_ty:
                 ft = m_ty.group(1).lower()
                 downloads[ft] = {
-                    "url": urljoin(BASE_URL, href),
+                    "url": urljoin(BASE_URL, href.replace("&amp;", "&")),
                     "regltn_no": m_no.group(1),
                     "regltn_se": m_se.group(1) if m_se else None,
                 }
 
-        # 이력 링크 (col4)
+        # 개정 이력 링크 추출 (현재 NST HTML에서는 미사용)
         history_url = None
         if col4:
             a = col4.find("a")
             if a:
                 href = a.get("href", "")
                 if href and href != "#":
-                    history_url = urljoin(BASE_URL, href)
+                    history_url = urljoin(BASE_URL, href.replace("&amp;", "&"))
 
         regulations.append({
             "number": number,
@@ -123,7 +156,7 @@ def _parse_regulations(soup: BeautifulSoup) -> list[dict]:
     return regulations
 
 
-# ────────────────────────────── MCP Server ──────────────────────────────
+# ─────────────────────────────── MCP Server ────────────────────────────────
 
 server = Server("nst-rulebook")
 
@@ -151,7 +184,10 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "org": {
                         "type": "string",
-                        "description": "기관 코드: NST(국가과학기술연구회), KICA(산업기술연구회), BRIC(기초기술연구회). 기본값: NST",
+                        "description": (
+                            "기관 코드: NST(국가과학기술연구회), "
+                            "KICA(산업기술연구회), BRIC(기초기술연구회). 기본값: NST"
+                        ),
                         "enum": ["NST", "KICA", "BRIC"],
                         "default": "NST",
                     }
@@ -171,7 +207,10 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "chapter_no": {
                         "type": "string",
-                        "description": "편 번호 (예: '3' = 제1편, '7' = 제2편). list_chapters로 조회 가능.",
+                        "description": (
+                            "편 번호 (예: '3' = 제1편, '11' = 제3.1편 인사관리). "
+                            "list_chapters로 조회 가능."
+                        ),
                     },
                     "org": {
                         "type": "string",
@@ -187,7 +226,7 @@ async def list_tools() -> list[types.Tool]:
             name="search_regulations",
             description=(
                 "특정 기관의 전체 규정을 키워드로 검색합니다. "
-                "모든 편을 순회하며 제목에서 키워드를 검색합니다."
+                "모든 편을 병렬로 조회하며 제목에서 키워드를 검색합니다."
             ),
             inputSchema={
                 "type": "object",
@@ -217,7 +256,7 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "regltn_no": {
                         "type": "string",
-                        "description": "규정 번호 (예: '6'). list_regulations 결과에서 확인.",
+                        "description": "규정 번호 (예: '12'). list_regulations 결과에서 확인.",
                     },
                     "regltn_se": {
                         "type": "string",
@@ -239,16 +278,17 @@ async def list_tools() -> list[types.Tool]:
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
     try:
+        # ── list_organizations ────────────────────────────────────────────
         if name == "list_organizations":
             lines = ["## 기관 목록\n"]
             for code, info in ORGANIZATIONS.items():
                 lines.append(f"- 코드: `{code}` | 이름: {info['name']}")
             return [types.TextContent(type="text", text="\n".join(lines))]
 
+        # ── list_chapters ─────────────────────────────────────────────────
         elif name == "list_chapters":
-            org_code = arguments.get("org", "NST")
+            org_code = (arguments.get("org") or "NST").upper()
             org = ORGANIZATIONS.get(org_code, ORGANIZATIONS["NST"])
-            # 아무 편 번호나 지정해서 페이지 로드 (select 옵션은 항상 전체 표시)
             soup = await fetch_page(
                 BASE_URL + "index.do",
                 params={"searchRegltn": org["regltn"], "searchUpperRegltnNo": "1"},
@@ -256,38 +296,47 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             chapters = _parse_chapters(soup)
             if not chapters:
                 return [types.TextContent(type="text", text="편 목록을 찾을 수 없습니다.")]
-            lines = [f"## {org['name']} 규정집 편 목록\n",
-                     "| 편 번호(chapter_no) | 편 이름 |",
-                     "|----|------|"]
+            lines = [
+                f"## {org['name']} 규정집 편 목록\n",
+                "| 편 번호(chapter_no) | 편 이름 |",
+                "|----|------|",
+            ]
             for ch in chapters:
                 lines.append(f"| `{ch['no']}` | {ch['name']} |")
             return [types.TextContent(type="text", text="\n".join(lines))]
 
+        # ── list_regulations ──────────────────────────────────────────────
         elif name == "list_regulations":
-            chapter_no = arguments["chapter_no"]
-            org_code = arguments.get("org", "NST")
+            chapter_no = str(arguments["chapter_no"])
+            org_code = (arguments.get("org") or "NST").upper()
             org = ORGANIZATIONS.get(org_code, ORGANIZATIONS["NST"])
             soup = await fetch_page(
                 BASE_URL + "index.do",
                 params={"searchRegltn": org["regltn"], "searchUpperRegltnNo": chapter_no},
             )
-            # 현재 선택된 편 이름 추출
-            chapter_name = ""
-            sel = soup.find("select", {"id": "sel_01"})
+
+            # 현재 선택된 편 이름 추출 (html.parser는 마지막 id 값 사용)
+            chapter_name = chapter_no
+            sel = soup.find("select", {"id": "searchUpperRegltnNo"})
             if sel:
                 for opt in sel.find_all("option"):
-                    if opt.get("selected"):
-                        chapter_name = opt.get_text(" ", strip=True).replace("\xa0", " ").strip()
+                    if opt.get("selected") is not None:
+                        chapter_name = re.sub(
+                            r"[\xa0\s]+", " ", opt.get_text(" ", strip=True)
+                        ).strip()
                         break
 
             regs = _parse_regulations(soup)
             if not regs:
                 return [types.TextContent(
                     type="text",
-                    text=(f"편 번호 `{chapter_no}`에서 규정을 찾을 수 없습니다. "
-                          "list_chapters로 올바른 편 번호를 확인하세요."),
+                    text=(
+                        f"편 번호 `{chapter_no}`에서 규정을 찾을 수 없습니다. "
+                        "list_chapters로 올바른 편 번호를 확인하세요."
+                    ),
                 )]
-            lines = [f"## {org['name']} — {chapter_name or chapter_no} 규정 목록\n"]
+
+            lines = [f"## {org['name']} — {chapter_name} 규정 목록\n"]
             for reg in regs:
                 lines.append(f"### [{reg['number']}] {reg['title']}")
                 if reg["external_url"]:
@@ -302,28 +351,39 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
                 lines.append("")
             return [types.TextContent(type="text", text="\n".join(lines))]
 
+        # ── search_regulations ────────────────────────────────────────────
         elif name == "search_regulations":
             keyword = arguments["keyword"]
-            org_code = arguments.get("org", "NST")
+            org_code = (arguments.get("org") or "NST").upper()
             org = ORGANIZATIONS.get(org_code, ORGANIZATIONS["NST"])
 
-            soup_first = await fetch_page(
-                BASE_URL + "index.do",
-                params={"searchRegltn": org["regltn"], "searchUpperRegltnNo": "1"},
-            )
-            chapters = _parse_chapters(soup_first)
+            # 단일 클라이언트 공유 + 세마포어로 동시 연결 수 제한
+            async with httpx.AsyncClient(
+                headers=HEADERS, follow_redirects=True, timeout=30
+            ) as client:
+                soup_first = await fetch_page(
+                    BASE_URL + "index.do",
+                    params={"searchRegltn": org["regltn"], "searchUpperRegltnNo": "1"},
+                    client=client,
+                )
+                chapters = _parse_chapters(soup_first)
 
-            async def fetch_chapter(ch: dict) -> tuple[dict, list[dict]]:
-                try:
-                    s = await fetch_page(
-                        BASE_URL + "index.do",
-                        params={"searchRegltn": org["regltn"], "searchUpperRegltnNo": ch["no"]},
-                    )
-                    return ch, _parse_regulations(s)
-                except Exception:
-                    return ch, []
+                async def fetch_chapter(ch: dict) -> tuple[dict, list[dict]]:
+                    async with _SEMAPHORE:
+                        try:
+                            s = await fetch_page(
+                                BASE_URL + "index.do",
+                                params={
+                                    "searchRegltn": org["regltn"],
+                                    "searchUpperRegltnNo": ch["no"],
+                                },
+                                client=client,
+                            )
+                            return ch, _parse_regulations(s)
+                        except Exception:
+                            return ch, []
 
-            results = await asyncio.gather(*[fetch_chapter(ch) for ch in chapters])
+                results = await asyncio.gather(*[fetch_chapter(ch) for ch in chapters])
 
             found = [
                 (ch, reg)
@@ -331,9 +391,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
                 for reg in regs
                 if keyword.lower() in reg["title"].lower()
             ]
-
             if not found:
-                return [types.TextContent(type="text", text=f"'{keyword}' 검색 결과가 없습니다.")]
+                return [types.TextContent(
+                    type="text", text=f"'{keyword}' 검색 결과가 없습니다."
+                )]
 
             lines = [f"## '{keyword}' 검색 결과 — {org['name']} ({len(found)}건)\n"]
             for ch, reg in found:
@@ -344,14 +405,15 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
                 lines.append("")
             return [types.TextContent(type="text", text="\n".join(lines))]
 
+        # ── get_download_url ──────────────────────────────────────────────
         elif name == "get_download_url":
             regltn_no = arguments["regltn_no"]
             regltn_se = arguments["regltn_se"]
             ft = arguments.get("file_type", "pdf")
             url = (
                 BASE_URL
-                + f"downloadRegltnBook.do?regltnNo={regltn_no}"
-                f"&regltnSe={regltn_se}&atchmnflTy={ft}"
+                + f"downloadRegltnBook.do"
+                f"?regltnNo={regltn_no}&regltnSe={regltn_se}&atchmnflTy={ft}"
             )
             return [types.TextContent(
                 type="text",
@@ -372,7 +434,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
         return [types.TextContent(type="text", text=f"오류: {type(e).__name__}: {e}")]
 
 
-async def main():
+# ─────────────────────────────── 진입점 ─────────────────────────────────────
+
+async def main() -> None:
     async with stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,
