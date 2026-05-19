@@ -11,7 +11,7 @@ import asyncio
 import re
 import sys
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote
 
 import httpx
 from bs4 import BeautifulSoup
@@ -109,17 +109,24 @@ def _parse_regulations(soup: BeautifulSoup) -> list[dict]:
         # 제목 및 외부 링크 추출
         title = ""
         external_url = None
+        is_law_link = False  # 국가법령정보센터 링크 여부
         if col2:
             a = col2.find("a")
             if a:
                 raw = a.get_text(" ", strip=True)
-                # "* 국가법령정보센터(링크)" 형태 주석 제거
+                # "* 국가법령정보센터(링크)" 형태 주석 감지 후 제목만 추출
+                is_law_link = bool(re.search(r"법령정보|링크", raw))
                 title = re.sub(r"\s*\*\s*.+$", "", raw).strip()
                 href = a.get("href", "")
                 if href.startswith("http"):
                     external_url = href
+                elif is_law_link and title:
+                    # href="#" 형태: 국가법령정보센터 URL을 법령명으로 직접 생성
+                    external_url = f"https://www.law.go.kr/법령/{quote(title)}"
             else:
-                title = re.sub(r"\s*\*\s*.+$", "", col2.get_text(" ", strip=True)).strip()
+                raw = col2.get_text(" ", strip=True)
+                is_law_link = bool(re.search(r"법령정보|링크", raw))
+                title = re.sub(r"\s*\*\s*.+$", "", raw).strip()
 
         # HWP / PDF 다운로드 링크 추출
         downloads: dict[str, dict] = {}
@@ -150,6 +157,7 @@ def _parse_regulations(soup: BeautifulSoup) -> list[dict]:
             "number": number,
             "title": title,
             "external_url": external_url,
+            "is_law_link": is_law_link,
             "downloads": downloads,
             "history_url": history_url,
         })
@@ -340,12 +348,19 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             for reg in regs:
                 lines.append(f"### [{reg['number']}] {reg['title']}")
                 if reg["external_url"]:
-                    lines.append(f"- 외부 링크: {reg['external_url']}")
+                    if reg["is_law_link"]:
+                        lines.append(
+                            f"- 국가법령정보센터(링크): {reg['external_url']}"
+                            f"  ※ 이 규정은 국가법령정보센터에서 제공합니다. 링크를 브라우저에서 열어 확인하세요."
+                        )
+                    else:
+                        lines.append(f"- 외부 링크: {reg['external_url']}")
                 for ft, info in reg["downloads"].items():
                     lines.append(
-                        f"- 다운로드 {ft.upper()}: {info['url']}  "
-                        f"(regltn_no=`{info['regltn_no']}`, regltn_se=`{info['regltn_se']}`)"
+                        f"- 다운로드 {ft.upper()}: {info['url']}"
                     )
+                if not reg["downloads"] and not reg["external_url"]:
+                    lines.append("- 다운로드 링크 없음 (파일 미등록)")
                 if reg["history_url"]:
                     lines.append(f"- 개정 이력: {reg['history_url']}")
                 lines.append("")
@@ -402,6 +417,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
                 lines.append(f"- 편: {ch['name']} (chapter_no=`{ch['no']}`)")
                 for ft, info in reg["downloads"].items():
                     lines.append(f"- 다운로드 {ft.upper()}: {info['url']}")
+                if reg["external_url"] and not reg["downloads"]:
+                    if reg["is_law_link"]:
+                        lines.append(f"- 국가법령정보센터(링크): {reg['external_url']}")
+                    else:
+                        lines.append(f"- 외부 링크: {reg['external_url']}")
                 lines.append("")
             return [types.TextContent(type="text", text="\n".join(lines))]
 
