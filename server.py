@@ -8,6 +8,7 @@ URL 파라미터 구조:
 """
 
 import asyncio
+import io
 import re
 import sys
 from typing import Any
@@ -15,6 +16,7 @@ from urllib.parse import urljoin, quote
 
 import httpx
 from bs4 import BeautifulSoup
+from pypdf import PdfReader
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp import types
@@ -280,6 +282,37 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["regltn_no", "regltn_se"],
             },
         ),
+        types.Tool(
+            name="get_regulation_text",
+            description=(
+                "규정 PDF 파일을 다운로드하여 본문 텍스트를 추출합니다. "
+                "규정 내용을 직접 읽거나 특정 조항을 검색할 때 사용하세요. "
+                "list_regulations 결과의 regltn_no, regltn_se 값을 사용하세요."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "regltn_no": {
+                        "type": "string",
+                        "description": "규정 번호 (예: '91'). list_regulations 결과에서 확인.",
+                    },
+                    "regltn_se": {
+                        "type": "string",
+                        "description": "규정 구분 코드 (예: 'REGLTN01'). list_regulations 결과에서 확인.",
+                    },
+                    "keyword": {
+                        "type": "string",
+                        "description": "본문에서 찾을 키워드 (선택). 지정 시 해당 키워드 주변 문맥만 반환.",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "반환할 최대 글자 수 (기본값: 8000). 전체 본문이 필요하면 크게 설정.",
+                        "default": 8000,
+                    },
+                },
+                "required": ["regltn_no", "regltn_se"],
+            },
+        ),
     ]
 
 
@@ -439,6 +472,90 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
                 type="text",
                 text=f"## 다운로드 URL\n\n- 형식: **{ft.upper()}**\n- URL: {url}",
             )]
+
+        # ── get_regulation_text ───────────────────────────────────────────
+        elif name == "get_regulation_text":
+            regltn_no = arguments["regltn_no"]
+            regltn_se = arguments["regltn_se"]
+            keyword = arguments.get("keyword", "").strip()
+            max_chars = int(arguments.get("max_chars", 8000))
+
+            pdf_url = (
+                BASE_URL
+                + f"downloadRegltnBook.do"
+                f"?regltnNo={regltn_no}&regltnSe={regltn_se}&atchmnflTy=pdf"
+            )
+
+            async with httpx.AsyncClient(
+                headers=HEADERS, follow_redirects=True, timeout=60
+            ) as client:
+                resp = await client.get(pdf_url)
+                resp.raise_for_status()
+
+                ct = resp.headers.get("content-type", "")
+                if "html" in ct.lower():
+                    return [types.TextContent(
+                        type="text",
+                        text="해당 규정의 PDF 파일을 찾을 수 없습니다. regltn_no, regltn_se 값을 확인하세요.",
+                    )]
+
+            # PDF 텍스트 추출
+            reader = PdfReader(io.BytesIO(resp.content))
+            pages_text: list[str] = []
+            for page in reader.pages:
+                text = page.extract_text() or ""
+                # 줄바꿈 정리: 한글 PDF 특성상 띄어쓰기 없이 붙는 경우가 많아 단어 경계를 보존
+                text = re.sub(r"[ \t]+", " ", text)
+                pages_text.append(text)
+
+            full_text = "\n".join(pages_text)
+            total_pages = len(reader.pages)
+
+            if keyword:
+                # 키워드 주변 문맥(앞뒤 300자) 추출
+                contexts: list[str] = []
+                lower_text = full_text.lower()
+                lower_kw = keyword.lower()
+                start = 0
+                while True:
+                    idx = lower_text.find(lower_kw, start)
+                    if idx == -1:
+                        break
+                    ctx_start = max(0, idx - 300)
+                    ctx_end = min(len(full_text), idx + len(keyword) + 300)
+                    snippet = full_text[ctx_start:ctx_end]
+                    contexts.append(f"...{snippet}...")
+                    start = idx + 1
+
+                if not contexts:
+                    return [types.TextContent(
+                        type="text",
+                        text=(
+                            f"PDF 전체 {total_pages}페이지에서 '{keyword}'를 찾을 수 없습니다.\n\n"
+                            f"**다운로드 URL:** {pdf_url}"
+                        ),
+                    )]
+
+                result = (
+                    f"## 규정 본문 검색 결과 — '{keyword}' ({len(contexts)}건)\n"
+                    f"(regltn_no=`{regltn_no}`, 총 {total_pages}페이지)\n\n"
+                )
+                combined = "\n\n---\n\n".join(contexts)
+                if len(combined) > max_chars:
+                    combined = combined[:max_chars] + "\n\n...(이하 생략)"
+                result += combined
+            else:
+                # 전체 본문 반환 (max_chars 제한)
+                result = (
+                    f"## 규정 본문 전문\n"
+                    f"(regltn_no=`{regltn_no}`, 총 {total_pages}페이지)\n\n"
+                )
+                if len(full_text) > max_chars:
+                    result += full_text[:max_chars] + f"\n\n...(전체 {len(full_text)}자 중 {max_chars}자 표시. max_chars 값을 늘리면 더 볼 수 있습니다.)"
+                else:
+                    result += full_text
+
+            return [types.TextContent(type="text", text=result)]
 
         else:
             return [types.TextContent(type="text", text=f"알 수 없는 도구: {name}")]
