@@ -181,6 +181,7 @@ async def list_tools() -> list[types.Tool]:
                 "기관 코드(NST / KICA / BRIC)와 이름을 확인할 수 있습니다."
             ),
             inputSchema={"type": "object", "properties": {}, "required": []},
+            annotations=types.ToolAnnotations(readOnlyHint=True),
         ),
         types.Tool(
             name="list_chapters",
@@ -204,6 +205,7 @@ async def list_tools() -> list[types.Tool]:
                 },
                 "required": [],
             },
+            annotations=types.ToolAnnotations(readOnlyHint=True),
         ),
         types.Tool(
             name="list_regulations",
@@ -231,6 +233,7 @@ async def list_tools() -> list[types.Tool]:
                 },
                 "required": ["chapter_no"],
             },
+            annotations=types.ToolAnnotations(readOnlyHint=True),
         ),
         types.Tool(
             name="search_regulations",
@@ -254,6 +257,7 @@ async def list_tools() -> list[types.Tool]:
                 },
                 "required": ["keyword"],
             },
+            annotations=types.ToolAnnotations(readOnlyHint=True),
         ),
         types.Tool(
             name="get_download_url",
@@ -281,6 +285,7 @@ async def list_tools() -> list[types.Tool]:
                 },
                 "required": ["regltn_no", "regltn_se"],
             },
+            annotations=types.ToolAnnotations(readOnlyHint=True),
         ),
         types.Tool(
             name="get_regulation_text",
@@ -312,6 +317,7 @@ async def list_tools() -> list[types.Tool]:
                 },
                 "required": ["regltn_no", "regltn_se"],
             },
+            annotations=types.ToolAnnotations(readOnlyHint=True),
         ),
     ]
 
